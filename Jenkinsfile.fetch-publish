@@ -1,127 +1,170 @@
 #!/usr/bin/env groovy
 
 /*
- * Pipeline A: metadata-fetch-publish
+ * Pipeline: metadata-fetch-publish
  *
  * Runs on trusted.ci.jenkins.io (scheduled daily at ~3 AM UTC).
  * Fetches jenkins-infra/metadata-plugin-modernizer, transforms data,
  * and publishes to reports.jenkins.io/plugin-modernizer-stats/
  *
  * Script path: Jenkinsfile.fetch-publish
- * (Separate from the default Jenkinsfile used by Pipeline B on ci.jenkins.io)
  *
- * Reference: jenkins-infra/pipeline-library publishReports convention
- * Reference: jenkins-infra/pipeline-steps-doc-generator/Jenkinsfile
- * Reference: jenkins-infra/infra-statistics/Jenkinsfile
+ * References:
+ *   - jenkins-infra/pipeline-library vars/publishReports.groovy
+ *   - jenkins-infra/repository-permissions-updater/Jenkinsfile  (publishReports pattern)
+ *   - jenkins-infra/pipeline-steps-doc-generator/Jenkinsfile    (infra.publishReports pattern)
  */
 
-// Set the cron trigger programmatically (infra-statistics pattern)
 properties([
     pipelineTriggers([
         cron('H 3 * * *'),
-        // Future: add pollSCM or webhook trigger from metadata-plugin-modernizer
     ]),
     buildDiscarder(logRotator(numToKeepStr: '10')),
 ])
 
-// Node label: use 'linux' which picks up a standard Linux agent on trusted.ci
-// Do NOT hardcode a machine name — use a label
+// Fix #6: use an explicit flag rather than `return` inside a stage block.
+// In a scripted pipeline, `return` exits the stage *closure* but does NOT
+// stop subsequent stages from running.  A boolean flag checked at the top
+// of each stage is the idiomatic scripted-pipeline early-exit pattern.
+def dataChanged = true
+
 node('linux') {
 
-    stage('Checkout') {
-        checkout scm
-    }
+    // Fix #11: wrap everything in try/finally so we always send a failure
+    // notification and always attempt workspace cleanup, even on error.
+    try {
 
-    stage('Fetch Metadata') {
-        // This stage has no elevated credentials — it only downloads public GitHub data.
-        // The fetch script uses ETag caching: on HTTP 304, it exits 0 but does not
-        // re-extract data. We check for the signal file to determine if data changed.
-        sh 'bash scripts/fetch-metadata-plugin-modernizer.sh'
-
-        // If fetch exited 0 but data is unchanged (ETag 304 path with existing cache),
-        // the summary.md in the extracted dir will exist from a previous run.
-        // On a truly fresh 304, the script exits early and .tmp/ may not be populated
-        // if the workspace is ephemeral. Check for the critical marker file.
-        if (!fileExists('.tmp/metadata-plugin-modernizer-main/reports/summary.md')) {
-            echo 'Data unchanged (ETag cache hit) or extraction not present. Skipping transform and publish.'
-            currentBuild.result = 'NOT_BUILT'
-            return
+        stage('Checkout') {
+            checkout scm
         }
-    }
 
-    stage('Transform Data') {
-        // Install Node.js tooling via the NodeJS plugin's tool() step.
-        // The tool name 'nodejs-20' must be configured in Jenkins Global Tool Configuration.
-        // Prerequisite: jenkins-infra/helpdesk issue for nodejs-20 on trusted.ci.jenkins.io
-        def nodeHome = tool name: 'nodejs-20', type: 'nodejs'
-        withEnv(["PATH+NODE=${nodeHome}/bin"]) {
-            sh 'node --version'
-            sh 'npm ci --ignore-scripts'
-            // OUTPUT_DIR is relative — it produces plugin-modernizer-stats/ in workspace root,
-            // which will be ZIPped with the correct internal directory structure.
-            withEnv([
-                'OUTPUT_DIR=plugin-modernizer-stats',
-                "BUILD_NUMBER=${env.BUILD_NUMBER}",
-                "BUILD_URL=${env.BUILD_URL}",
-            ]) {
-                sh 'npx tsx scripts/consolidate.ts'
+        stage('Fetch Metadata') {
+            sh 'bash scripts/fetch-metadata-plugin-modernizer.sh'
+
+            // The fetch script validates the extracted directory itself.
+            // We only need to check for the sentinel file here to decide
+            // whether to skip the rest of the pipeline on a 304 hit.
+            if (!fileExists('.tmp/metadata-plugin-modernizer-main/reports/summary.md')) {
+                echo 'Data unchanged (ETag 304 cache hit) — skipping Transform and Publish.'
+                currentBuild.result = 'NOT_BUILT'
+                dataChanged = false
             }
         }
-    }
 
-    stage('Package') {
-        // Create the ZIP with the correct internal directory structure.
-        // The ZIP root must be plugin-modernizer-stats/ so that reports.jenkins.io
-        // serves content at /plugin-modernizer-stats/
-        sh '''
-            rm -f plugin-modernizer-stats.zip
-            zip -r plugin-modernizer-stats.zip plugin-modernizer-stats/
-            echo "ZIP contents (first 20 entries):"
-            unzip -l plugin-modernizer-stats.zip | head -20
-            echo "ZIP size: $(du -sh plugin-modernizer-stats.zip | cut -f1)"
-        '''
-    }
+        // Fix #6: every subsequent stage is gated on the dataChanged flag
+        // so the pipeline genuinely short-circuits rather than just exiting
+        // a single stage closure.
+        if (dataChanged) {
 
-    stage('Validate Package') {
-        // Verify the ZIP contains the expected critical files before publishing
-        sh '''
-            set -euo pipefail
-            REQUIRED=(
-                "plugin-modernizer-stats/summary.json"
-                "plugin-modernizer-stats/manifest.json"
-                "plugin-modernizer-stats/plugin-recipes-index.json"
+            stage('Transform Data') {
+                // OUTPUT_DIR must match the directory name expected by the
+                // Validate JSON and Package stages below.  The default inside
+                // consolidate.py is 'plugin-modernizer-stats', so we set it
+                // explicitly here to make the contract visible and to guard
+                // against the default changing upstream (issue #9 — left as-is
+                // per instructions but the explicit set keeps things clear).
+                withEnv(['OUTPUT_DIR=plugin-modernizer-stats']) {
+                    sh 'python3 --version'
+                    sh 'python3 scripts/consolidate.py'
+                }
+            }
+
+            stage('Validate JSON') {
+                // Independent second-pass JSON validation after consolidate.py's
+                // own post-write round-trip check.
+                sh '''
+                    set -euo pipefail
+                    python3 -m json.tool < plugin-modernizer-stats/summary.json > /dev/null
+                    echo "OK: summary.json is valid JSON"
+                    python3 -m json.tool < plugin-modernizer-stats/plugin-recipes-index.json > /dev/null
+                    echo "OK: plugin-recipes-index.json is valid JSON"
+                '''
+            }
+
+            // Fix #4: publishing is fully delegated to the publishReports
+            // shared library step from jenkins-infra/pipeline-library.
+            // The step internally handles:
+            //   • ZIP creation with the correct internal directory layout
+            //   • trusted vs non-trusted environment gating
+            //   • archiving locally when not on trusted.ci
+            // This replaces the inline Package / Validate Package / Publish
+            // stages from the original Jenkinsfile and removes the duplicate
+            // logic that also existed in publishPluginModernizerStats.groovy.
+            stage('Publish') {
+                // publishReports is a global step provided by the implicitly
+                // loaded pipeline-library on *.ci.jenkins.io controllers.
+                // Signature (from pipeline-library vars/publishReports.groovy):
+                //   publishReports(List<String> reports, Map options = [:])
+                //
+                // The step expects files that already exist in the current
+                // working directory (or sub-paths relative to it).
+                //
+                // Real-world usage reference:
+                //   jenkins-infra/repository-permissions-updater Jenkinsfile:
+                //     publishReports(['*.json'], [useWorkloadIdentity: true])
+                //
+                //   jenkins-infra/pipeline-steps-doc-generator Jenkinsfile:
+                //     infra.publishReports(['allAscii.zip', 'declarative.zip'])
+                //
+                // We pass the output directory directly (no ZIP step here —
+                // publishReports handles packaging internally).
+                if (infra.isTrusted()) {
+                    publishReports(['plugin-modernizer-stats'], [useWorkloadIdentity: true])
+                    echo 'Published to reports.jenkins.io/plugin-modernizer-stats/'
+                } else {
+                    // On non-trusted controllers (ci.jenkins.io, PR builds):
+                    // ZIP and archive locally so the output is still inspectable.
+                    sh '''
+                        rm -f plugin-modernizer-stats.zip
+                        zip -r plugin-modernizer-stats.zip plugin-modernizer-stats/
+                    '''
+                    archiveArtifacts artifacts: 'plugin-modernizer-stats.zip', fingerprint: true
+                    echo 'Non-trusted build: artifact archived locally for inspection.'
+                }
+            }
+
+        } // end if (dataChanged)
+
+    } catch (err) {
+        // Fix #11: mark the build as failed and re-throw so Jenkins records
+        // the correct status before the finally block runs.
+        currentBuild.result = 'FAILURE'
+        throw err
+
+    } finally {
+
+        // Fix #11: send a failure notification so stale-data issues are caught
+        // promptly rather than only when someone manually inspects the site.
+        // Uses the Jenkins built-in emailext (Email Extension Plugin) which is
+        // present on all *.ci.jenkins.io controllers.
+        if (currentBuild.result == 'FAILURE') {
+            emailext(
+                subject: "[Jenkins] FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """\
+The plugin-modernizer stats fetch/publish pipeline failed.
+
+Job:   ${env.JOB_NAME}
+Build: ${env.BUILD_NUMBER}
+URL:   ${env.BUILD_URL}
+
+Check the console log for details.
+""",
+                // Adjust the recipient list to match your team's convention.
+                // On jenkins-infra projects this is typically the infra mailing list.
+                to: 'infra@lists.jenkins-ci.org',
+                recipientProviders: [culprits(), requestor()],
             )
-            for entry in "${REQUIRED[@]}"; do
-                if ! unzip -l plugin-modernizer-stats.zip | grep -q "$entry"; then
-                    echo "ERROR: Required entry missing from ZIP: $entry"
-                    exit 1
-                fi
-                echo "OK: $entry"
-            done
-        '''
-    }
-
-    stage('Publish') {
-        // infra.isTrusted() returns true on trusted.ci.jenkins.io
-        // On all other controllers (ci.jenkins.io, PR builds) it archives locally
-        if (infra.isTrusted()) {
-            infra.publishReports(['plugin-modernizer-stats.zip'])
-            echo 'Published to reports.jenkins.io/plugin-modernizer-stats/'
-        } else {
-            archiveArtifacts artifacts: 'plugin-modernizer-stats.zip', fingerprint: true
-            echo 'Non-trusted build: artifact archived locally for inspection.'
         }
-    }
 
-    stage('Cleanup') {
-        // Always clean workspace artifacts to avoid disk exhaustion.
-        // Keep .tmp/.etag for incremental downloads (if workspace is persistent).
+        // Always clean up generated workspace artefacts to avoid disk
+        // exhaustion on the agent.  The .tmp/ directory (including .etag)
+        // is intentionally NOT removed here: if the workspace is persistent
+        // (non-ephemeral agent) the ETag file survives to enable 304 caching
+        // on the next scheduled run.
         sh '''
-            rm -f plugin-modernizer-stats.zip
+            rm -f  plugin-modernizer-stats.zip
             rm -rf plugin-modernizer-stats/
         '''
-        // Note: .tmp/ and .tmp/.etag are intentionally kept if workspace is reused,
-        // so the next run can use ETag caching. If workspace is always fresh (ephemeral
-        // agents), ETag caching will not persist — this is acceptable and expected.
     }
+
 }
