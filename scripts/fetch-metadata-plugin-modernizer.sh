@@ -1,120 +1,160 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"; }
 
 # ── Configuration ────────────────────────────────────────────────────────────
 ZIP_URL="https://github.com/jenkins-infra/metadata-plugin-modernizer/archive/refs/heads/main.zip"
 TMP_DIR=".tmp"
-ZIP_FILE="metadata-plugin-modernizer.zip"
+ZIP_FILE="${TMP_DIR}/metadata-plugin-modernizer-main.zip"
+HEADER_FILE="${TMP_DIR}/.last-headers"
 ETAG_FILE="${TMP_DIR}/.etag"
-RAW_DIR="${TMP_DIR}/raw"
 EXTRACTED_DIR="${TMP_DIR}/metadata-plugin-modernizer-main"
 
-# ── Dependency check ────────────────────────────────────────────────────────
-command -v curl >/dev/null 2>&1 || { log "ERROR: 'curl' is required but not installed."; exit 1; }
-command -v unzip >/dev/null 2>&1 || { log "ERROR: 'unzip' is required but not installed."; exit 1; }
+# ── Dependency check ─────────────────────────────────────────────────────────
+for cmd in curl unzip; do
+    command -v "${cmd}" >/dev/null 2>&1 || { echo "[ERROR] '${cmd}' is required but not installed."; exit 1; }
+done
 
-# ── Cleanup trap: always remove ZIP and raw extraction dir on exit ───────────
-trap 'rm -f "${ZIP_FILE}"; rm -rf "${RAW_DIR}"' EXIT
+# ── Cleanup trap: always remove ZIP and temp headers on exit ─────────────────
+# The extracted directory is intentionally kept for the Transform stage.
+cleanup() {
+    rm -f "${ZIP_FILE}" "${HEADER_FILE}"
+}
+trap cleanup EXIT
 
-# ── Prepare temp directory ──────────────────────────────────────────────────
+# ── Prepare temp directory ───────────────────────────────────────────────────
 mkdir -p "${TMP_DIR}"
 
-# ── ETag-based incremental download ────────────────────────────────────────
-log "Checking for upstream data changes..."
+# ── ETag-based incremental download ─────────────────────────────────────────
+# Fix #7: capture response headers from the *same* GET request using
+# --dump-header so the ETag we store is always consistent with the body we
+# actually downloaded — no second HEAD request, no race condition.
+CURL_ARGS=(
+    --silent
+    --location
+    --fail
+    --output "${ZIP_FILE}"
+    --dump-header "${HEADER_FILE}"
+    --write-out "%{http_code}"
+)
 
-CURL_ARGS=(--silent --location --fail --output "${ZIP_FILE}" --dump-header "${TMP_DIR}/.response-headers")
-
-if [ -f "${ETAG_FILE}" ]; then
+# Fix #3: ETag caching strategy.
+# On ephemeral agents the workspace is wiped each build, so .etag never
+# survives between runs and we always get HTTP 200 — this is correct and safe.
+# On persistent workspaces (or when the workspace IS reused) the .etag file
+# survives and the 304 short-circuit becomes effective.
+# Either way, we never rely on stale extracted data without validation.
+if [ -f "${ETAG_FILE}" ] && [ -d "${EXTRACTED_DIR}" ]; then
     STORED_ETAG=$(cat "${ETAG_FILE}")
-    log "Found cached ETag: ${STORED_ETAG}"
+    echo "[INFO] Found cached ETag: ${STORED_ETAG}"
     CURL_ARGS+=(--header "If-None-Match: ${STORED_ETAG}")
 fi
 
-HTTP_CODE=$(curl --write-out "%{http_code}" "${CURL_ARGS[@]}" "${ZIP_URL}" 2>/dev/null || true)
+HTTP_CODE=$(curl "${CURL_ARGS[@]}" "${ZIP_URL}" 2>/dev/null || echo "000")
 
 if [ "${HTTP_CODE}" = "304" ]; then
-    log "Data unchanged (HTTP 304), skipping download."
-    # Validate the existing extracted data is still present
-    if [ -d "${EXTRACTED_DIR}" ]; then
-        log "Existing extracted data verified at ${EXTRACTED_DIR}."
-        rm -f "${TMP_DIR}/.response-headers"
-        exit 0
+    echo "[INFO] Data unchanged (HTTP 304) — reusing existing extracted data."
+    # Fall through to validation of the existing extraction below.
+
+elif [ "${HTTP_CODE}" = "200" ]; then
+    echo "[INFO] Downloaded fresh data (HTTP 200)."
+
+    # Extract the ETag from the response headers of THIS request (no race).
+    NEW_ETAG=$(grep -i '^etag:' "${HEADER_FILE}" \
+        | sed 's/^[eE][tT][aA][gG]: *//;s/[[:space:]]*$//' \
+        | head -1)
+    if [ -n "${NEW_ETAG}" ]; then
+        echo "${NEW_ETAG}" > "${ETAG_FILE}"
+        echo "[INFO] Saved ETag: ${NEW_ETAG}"
     else
-        log "WARN: HTTP 304 but extracted data missing. Re-downloading..."
-        # Remove stale ETag so we get a fresh download
+        # No ETag in response (e.g. GitHub changed behaviour) — purge stale
+        # cache so we never wrongly send If-None-Match on the next run.
         rm -f "${ETAG_FILE}"
-        HTTP_CODE=$(curl --write-out "%{http_code}" --silent --location --fail \
-            --output "${ZIP_FILE}" --dump-header "${TMP_DIR}/.response-headers" \
-            "${ZIP_URL}" 2>/dev/null || true)
+        echo "[WARN] No ETag in response headers — cache disabled for this run."
+    fi
+
+    # Remove old extracted data before unzipping the fresh archive.
+    rm -rf "${EXTRACTED_DIR}"
+
+    unzip -q -o "${ZIP_FILE}" -d "${TMP_DIR}"
+    echo "[INFO] Unzipped to ${EXTRACTED_DIR}"
+
+    # Remove repo-metadata files that are not needed for transform.
+    rm -rf "${EXTRACTED_DIR}/.github"
+    rm -f  "${EXTRACTED_DIR}/.gitignore" \
+           "${EXTRACTED_DIR}/README.md" \
+           "${EXTRACTED_DIR}/requirements.txt" \
+           "${EXTRACTED_DIR}/CONTRIBUTING.md" \
+           "${EXTRACTED_DIR}/CODE_OF_CONDUCT.md" \
+           "${EXTRACTED_DIR}/SECURITY.md"
+    echo "[INFO] Cleaned up repository metadata files."
+
+else
+    echo "[ERROR] Unexpected HTTP code: ${HTTP_CODE}"
+    if [ -d "${EXTRACTED_DIR}" ]; then
+        echo "[WARN] Falling back to previously cached extraction."
+    else
+        echo "[ERROR] No cached extraction available — cannot continue."
+        exit 1
     fi
 fi
 
-if [ "${HTTP_CODE}" = "200" ]; then
-    log "Downloaded fresh data (HTTP 200)."
+# ── Validate extracted content ───────────────────────────────────────────────
+# Fix #10: validate the specific sections/structure we actually parse so that
+# upstream format changes are caught early and loudly rather than silently
+# producing empty or wrong output.
+echo "[INFO] Validating extracted data..."
 
-    # Save ETag from response headers for next time
-    NEW_ETAG=$(grep -i '^etag:' "${TMP_DIR}/.response-headers" 2>/dev/null | sed 's/^[eE][tT][aA][gG]: *//;s/\r$//' | head -1)
-    if [ -n "${NEW_ETAG}" ]; then
-        echo "${NEW_ETAG}" > "${ETAG_FILE}"
-        log "Saved ETag: ${NEW_ETAG}"
-    else
-        log "WARN: No ETag in response headers. Incremental caching will not work for next run."
-    fi
+SUMMARY_MD="${EXTRACTED_DIR}/reports/summary.md"
 
-    # Remove old extracted data
-    rm -rf "${EXTRACTED_DIR}"
-
-    # Unzip — GitHub ZIP contains a top-level directory; strip it via mv
-    log "Extracting archive..."
-    mkdir -p "${RAW_DIR}"
-    unzip -q "${ZIP_FILE}" -d "${RAW_DIR}"
-    mv "${RAW_DIR}/metadata-plugin-modernizer-main" "${EXTRACTED_DIR}"
-    log "Extracted to ${EXTRACTED_DIR}"
-
-    # Remove unnecessary files from extracted content
-    log "Cleaning up non-essential files..."
-    rm -rf "${EXTRACTED_DIR}/.github"
-    rm -f "${EXTRACTED_DIR}/.gitignore"
-    rm -f "${EXTRACTED_DIR}/README.md"
-    rm -f "${EXTRACTED_DIR}/requirements.txt"
-    rm -f "${EXTRACTED_DIR}/CONTRIBUTING.md"
-    rm -f "${EXTRACTED_DIR}/CODE_OF_CONDUCT.md"
-    rm -f "${EXTRACTED_DIR}/SECURITY.md"
-    log "Cleaned up unnecessary files."
-
-    # Clean up response headers temp file
-    rm -f "${TMP_DIR}/.response-headers"
-else
-    log "ERROR: Failed to download data. HTTP code: ${HTTP_CODE}"
-    rm -f "${TMP_DIR}/.response-headers"
+if [ ! -f "${SUMMARY_MD}" ]; then
+    echo "[ERROR] Validation failed: reports/summary.md not found."
     exit 1
 fi
 
-# ── Validate extracted content ──────────────────────────────────────────────
-log "Validating extracted data..."
-
-REQUIRED_PATHS=(
-    "${EXTRACTED_DIR}/reports/summary.md"
-    "${EXTRACTED_DIR}/reports/recipes"
+# Check that every required section heading exists in summary.md.
+REQUIRED_SECTIONS=(
+    "## Overview"
+    "## Failures by Recipe"
+    "## Plugins with Failed Migrations"
+    "## Pull Request Statistics"
 )
-for rpath in "${REQUIRED_PATHS[@]}"; do
-    if [ ! -e "${rpath}" ]; then
-        log "ERROR: Required path missing after extraction: ${rpath}"
+for section in "${REQUIRED_SECTIONS[@]}"; do
+    if ! grep -qF "${section}" "${SUMMARY_MD}"; then
+        echo "[ERROR] Validation failed: missing section '${section}' in summary.md."
+        echo "[ERROR] Upstream format may have changed — review the raw file:"
+        head -30 "${SUMMARY_MD}" >&2
         exit 1
     fi
 done
 
-# Count plugin directories (exclude known non-plugin dirs)
-PLUGIN_COUNT=$(find "${EXTRACTED_DIR}" -maxdepth 1 -mindepth 1 -type d \
-    ! -name 'reports' ! -name '.github' ! -name '.git' ! -name 'CustomHistory' | wc -l)
-
-if [ "${PLUGIN_COUNT}" -lt 10 ]; then
-    log "ERROR: Expected at least 10 plugin directories, found ${PLUGIN_COUNT}"
+# Check that summary.md contains a 'Generated on:' timestamp line.
+if ! grep -q "Generated on:" "${SUMMARY_MD}"; then
+    echo "[ERROR] Validation failed: 'Generated on:' timestamp not found in summary.md."
     exit 1
 fi
 
-log "Validation passed: ${PLUGIN_COUNT} plugin directories found."
-log "Data ready in ${EXTRACTED_DIR}"
+if [ ! -d "${EXTRACTED_DIR}/reports/recipes" ] \
+   || [ -z "$(ls -A "${EXTRACTED_DIR}/reports/recipes" 2>/dev/null)" ]; then
+    echo "[ERROR] Validation failed: reports/recipes/ is missing or empty."
+    exit 1
+fi
+
+# Check that at least one plugin directory with a reports/ sub-directory exists.
+PLUGIN_WITH_REPORTS=0
+for dir in "${EXTRACTED_DIR}"/*/; do
+    dirname=$(basename "${dir}")
+    if [ "${dirname}" = "reports" ] || [ "${dirname}" = ".github" ] || [ "${dirname}" = ".git" ]; then
+        continue
+    fi
+    if [ -d "${dir}reports" ]; then
+        PLUGIN_WITH_REPORTS=$((PLUGIN_WITH_REPORTS + 1))
+    fi
+done
+
+if [ "${PLUGIN_WITH_REPORTS}" -lt 1 ]; then
+    echo "[ERROR] Validation failed: no plugin directories with a reports/ subdirectory found."
+    exit 1
+fi
+
+echo "[INFO] Validation passed — ${PLUGIN_WITH_REPORTS} plugin(s) with reports found."
+echo "[INFO] Data ready in ${EXTRACTED_DIR}"
