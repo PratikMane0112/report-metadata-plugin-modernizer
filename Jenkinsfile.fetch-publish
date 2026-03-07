@@ -17,7 +17,7 @@
 
 properties([
     pipelineTriggers([
-        cron('H 3 * * *'),
+        cron('H 1 * * 0'),
     ]),
     buildDiscarder(logRotator(numToKeepStr: '10')),
 ])
