@@ -3,7 +3,7 @@
 consolidate.py — Transforms raw metadata-plugin-modernizer data into structured JSON.
 
 ENV:
-    INPUT_DIR      default: .tmp/metadata-plugin-modernizer-main
+    INPUT_DIR      default: .  (workspace root = checkout of metadata-plugin-modernizer)
     OUTPUT_DIR     default: plugin-modernizer-stats
     MAX_ERROR_RATE default: 0.02  (fraction of plugin-copy failures tolerated)
 """
@@ -12,15 +12,15 @@ import hashlib, json, os, re, shutil, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-INPUT_BASE     = Path(os.environ.get("INPUT_DIR",  ".tmp/metadata-plugin-modernizer-main")).resolve()
-OUTPUT_BASE    = Path(os.environ.get("OUTPUT_DIR", "plugin-modernizer-stats")).resolve()
+INPUT_BASE     = Path(os.environ.get("INPUT_DIR",  ".")).resolve()
+OUTPUT_BASE    = Path(os.environ.get("OUTPUT_DIR", "/tmp/plugin-modernizer-stats")).resolve()
 MAX_ERROR_RATE = float(os.environ.get("MAX_ERROR_RATE", "0.02"))
 
 SUMMARY_MD  = INPUT_BASE / "reports" / "summary.md"
 RECIPES_SRC = INPUT_BASE / "reports" / "recipes"
 RECIPES_OUT = OUTPUT_BASE / "recipes"
 PLUGINS_OUT = OUTPUT_BASE / "plugins-reports"
-EXCLUDED_DIRS = frozenset([".github", "reports", ".git"])
+EXCLUDED_DIRS = frozenset([".github", "reports", ".git", "scripts"])
 
 # Both '*' and '-' bullets are valid in the actual summary.md.
 _RE_OVERVIEW = re.compile(r"^[-*]\s+\*\*(.+?)\*\*:\s*(.+)$")
@@ -416,7 +416,7 @@ def main():
     if not INPUT_BASE.exists():
         print(
             f"ERROR: Input directory not found: {INPUT_BASE}\n"
-            "Run: bash scripts/fetch-metadata-plugin-modernizer.sh",
+            "Expected INPUT_DIR to be the metadata-plugin-modernizer workspace root.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -467,17 +467,12 @@ def main():
         f"({len(plugin_names)} plugins, {len(recipe_names)} recipes)"
     )
 
-    # ── Validate outputs BEFORE deleting the input ───────────────────────────
-    # Fix #5: the original code deleted INPUT_BASE unconditionally at the end
-    # of main(), meaning a validation failure left no raw data to debug with
-    # and also meant the input was gone before any downstream stage could
-    # inspect it.  We now validate first; only on success do we remove the
-    # temp input directory.
+    # ── Validate outputs ────────────────────────────────────────────────────
+    # INPUT_BASE is the SCM workspace (checkout of metadata-plugin-modernizer).
+    # We NEVER delete it — that is the Jenkins agent's workspace managed by
+    # the pipeline. The Cleanup stage in Jenkinsfile.fetch-publish handles
+    # workspace housekeeping via cleanWs().
     validate(plugin_names, recipe_names)
-
-    # Input is removed only after successful validation.
-    shutil.rmtree(INPUT_BASE)
-    log(f"Removed temp input dir: {INPUT_BASE}")
 
     print(
         f"\nDone — {len(plugin_names)} plugins, {len(recipe_names)} recipes, "
