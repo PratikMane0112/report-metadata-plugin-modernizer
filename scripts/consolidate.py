@@ -27,7 +27,6 @@ _RE_OVERVIEW = re.compile(r"^[-*]\s+\*\*(.+?)\*\*:\s*(.+)$")
 _RE_RECIPE   = re.compile(r"^[-*]\s+([\w.]+):\s+(\d+)\s+failures?$")
 _RE_PLUGIN   = re.compile(r"^[-*]\s+\[([^\]]+)\]\([^)]+\)$")
 
-# Fix #10: known section names so we can warn loudly on unrecognised headings.
 _KNOWN_SECTIONS = frozenset([
     "overview",
     "recipes",
@@ -97,9 +96,6 @@ def parse_summary_md(content, sha256):
             generated_at = parse_timestamp(m.group(1))
             continue
 
-        # Fix #10: map section headings and warn on unknown h2 headings so
-        # upstream format changes are caught during parsing rather than
-        # silently producing missing fields later.
         if s.startswith("## "):
             heading = s[3:].strip()
             section = {
@@ -135,14 +131,6 @@ def parse_summary_md(content, sha256):
                 plugins.append(m.group(1))
 
         elif section == "pr":
-            # The plugin-modernizer-tool tracks three MUTUALLY EXCLUSIVE PR states:
-            #   Open   — PR is still open
-            #   Closed — PR was closed WITHOUT merging (rejected)
-            #   Merged — PR was merged
-            # So the correct invariant is: Open + Closed + Merged == Total
-            # "Closed" here is NOT the GitHub umbrella term (which includes merged);
-            # it specifically means unmerged-closed only.
-            # Verified against real data: 83 + 26 + 423 == 532 ✓
             if not s.startswith("|") or "---" in s or "Status" in s:
                 continue
             cells = [c.strip() for c in s.split("|") if c.strip()]
@@ -170,14 +158,7 @@ def parse_summary_md(content, sha256):
         raise ParseError(f"failed_migrations ({failed}) > total_migrations ({total})")
     if not (0.0 <= rate <= 100.0):
         raise ParseError(f"success_rate {rate} not in [0, 100]")
-
-    # PR count invariant: Open + Closed(unmerged) + Merged == Total
-    # The tool tracks three MUTUALLY EXCLUSIVE states:
-    #   Open   = still open
-    #   Closed = closed without merging (rejected)
-    #   Merged = merged
-    # "Closed" is NOT the GitHub umbrella term — it means unmerged-closed only.
-    # Verified against real data: 83 + 26 + 423 == 532
+        
     pr_sum = pr["Open PRs"] + pr["Closed PRs"] + pr["Merged PRs"]
     if pr_sum != pr["Total PRs"]:
         raise ParseError(
@@ -466,12 +447,7 @@ def main():
         f"Wrote plugin-recipes-index.json "
         f"({len(plugin_names)} plugins, {len(recipe_names)} recipes)"
     )
-
-    # ── Validate outputs ────────────────────────────────────────────────────
-    # INPUT_BASE is the SCM workspace (checkout of metadata-plugin-modernizer).
-    # We NEVER delete it — that is the Jenkins agent's workspace managed by
-    # the pipeline. The Cleanup stage in Jenkinsfile.fetch-publish handles
-    # workspace housekeeping via cleanWs().
+    
     validate(plugin_names, recipe_names)
 
     print(
