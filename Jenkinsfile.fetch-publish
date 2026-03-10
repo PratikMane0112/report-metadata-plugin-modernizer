@@ -1,21 +1,5 @@
 #!/usr/bin/env groovy
 /*
- * Pipeline A: ETL — transform and publish plugin-modernizer stats
- * Runs daily on trusted.ci.jenkins.io
- *
- * Repository : jenkins-infra/metadata-plugin-modernizer
- * Script path: Jenkinsfile.fetch-publish
- *
- * Design rationale:
- *   This Jenkinsfile lives IN metadata-plugin-modernizer because the
- *   trusted.ci job SCM IS metadata-plugin-modernizer. checkout scm checks
- *   out the data repo directly into the workspace — no separate fetch step,
- *   no clone, no .tmp/ directory. The workspace root IS the data.
- *   scripts/consolidate.py reads from INPUT_DIR=. directly.
- *
- *   This mirrors the infra-statistics pattern: Jenkinsfile and processing
- *   scripts live alongside the data they process in the same repository.
- *
  * Stage references:
  *   properties/cron   : infra-statistics/Jenkinsfile
  *   checkout scm      : infra-statistics/Jenkinsfile
@@ -36,20 +20,10 @@ node('linux') {
     try {
 
         stage('Checkout') {
-            // Checks out metadata-plugin-modernizer into the workspace root.
-            // The workspace IS the data — no separate fetch step needed.
-            // Jenkinsfile.fetch-publish and scripts/consolidate.py live here
-            // alongside the plugin data they process.
-            //
-            // Reference: infra-statistics/Jenkinsfile — checkout scm as the
-            // first stage; the repo contains both scripts and the data.
             checkout scm
         }
 
         stage('Validate Structure') {
-            // Validate that expected data structure is present before running
-            // the transform. Catches corrupt/incomplete checkouts and upstream
-            // format changes in summary.md early — before any Python runs.
             sh '''
                 set -euo pipefail
 
@@ -79,7 +53,6 @@ node('linux') {
                 done
                 echo "[OK] summary.md structure validated."
 
-                # Confirm at least one plugin directory with reports/ exists.
                 PLUGIN_COUNT=0
                 for dir in */; do
                     name="${dir%/}"
@@ -95,15 +68,6 @@ node('linux') {
         }
 
         stage('Transform Data') {
-            // INPUT_DIR=.  → consolidate.py reads from workspace root (the data).
-            // OUTPUT_DIR   → absolute path outside workspace so generated JSON
-            //                is never mistaken for plugin data by the script,
-            //                and is never accidentally committed or published
-            //                as part of the SCM checkout.
-            //
-            // Python 3 is available on all jenkins-infra linux agents.
-            // Reference: infra-statistics/Jenkinsfile — runs processing scripts
-            // against workspace data without additional tool setup.
             withEnv([
                 'INPUT_DIR=.',
                 'OUTPUT_DIR=/tmp/plugin-modernizer-stats',
@@ -114,9 +78,6 @@ node('linux') {
         }
 
         stage('Validate JSON') {
-            // Independent second-pass validation — does not trust
-            // consolidate.py's own internal post-write round-trip check.
-            // python3 -m json.tool requires no additional installation.
             sh '''
                 set -euo pipefail
                 python3 -m json.tool \
@@ -129,11 +90,6 @@ node('linux') {
         }
 
         stage('Publish') {
-            // Reference: repository-permissions-updater/Jenkinsfile —
-            //   publishReports(['...'], [useWorkloadIdentity: true])
-            //
-            // Non-trusted fallback: pipeline-steps-doc-generator/Jenkinsfile —
-            //   archiveArtifacts when not running on trusted.ci.
             if (infra.isTrusted()) {
                 dir('/tmp') {
                     publishReports(
@@ -156,16 +112,12 @@ node('linux') {
 
     } finally {
         if (currentBuild.result == 'FAILURE') {
-            // Reference: jenkins.io/Jenkinsfile —
-            //   mail to: 'infra@lists.jenkins-ci.org'
             mail(
                 subject: "${env.JOB_NAME} #${env.BUILD_NUMBER} failed",
                 body:    "ETL pipeline failed.\nBuild: ${env.BUILD_URL}",
                 to:      'infra@lists.jenkins-ci.org',
             )
         }
-        // Clean generated output from /tmp only — NOT the workspace.
-        // The workspace is the SCM checkout; Jenkins manages it via cleanWs().
         sh 'rm -rf /tmp/plugin-modernizer-stats /tmp/plugin-modernizer-stats.zip'
         cleanWs()
     }
