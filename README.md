@@ -1,1 +1,1 @@
-<img width="2760" height="1504" alt="CI_Pipeline" src="https://github.com/user-attachments/assets/dbd7a8cd-3b01-4cbc-805c-d1d78b41c307" />
+<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/25071dc0-e8e2-45fa-8e75-f2e9e83c1bca" />
